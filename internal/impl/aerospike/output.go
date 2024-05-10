@@ -2,16 +2,18 @@ package aerospike
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
+	as "github.com/aerospike/aerospike-client-go/v6"
 	"math"
 	"math/rand"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gocql/gocql"
 
-	"github.com/benthosdev/benthos/v4/internal/component/output"
 	"github.com/benthosdev/benthos/v4/public/bloblang"
 	"github.com/benthosdev/benthos/v4/public/service"
 )
@@ -26,67 +28,28 @@ const (
 
 func outputSpec() *service.ConfigSpec {
 	return service.NewConfigSpec().
-		Beta().
-		Summary("Runs a put against a aerospike database for each message in order to insert data.").
-		Description(output.Description(true, true, `
-Query arguments can be set using a bloblang array for the fields using the `+"`args_mapping`"+` field.
+		Stable().
+		Categories("Services").
+		Summary("Publish to an aerospike set.").
+		Description(`This output will interpolate functions within the aerospike set).
 
-When populating timestamp columns the value must either be a string in ISO 8601 format (2006-01-02T15:04:05Z07:00), or an integer representing unix time in seconds.`)).
-		Example(
-			"Basic Inserts",
-			"If we were to create a table with some basic columns with `CREATE TABLE foo.bar (id int primary key, content text, created_at timestamp);`, and were processing JSON documents of the form `{\"id\":\"342354354\",\"content\":\"hello world\",\"timestamp\":1605219406}` using logged batches, we could populate our table with the following config:",
-			`
-output:
-  aerospike:
-    addresses:
-      - localhost:9042
-    query: 'INSERT INTO foo.bar (id, content, created_at) VALUES (?, ?, ?)'
-    args_mapping: |
-      root = [
-        this.id,
-        this.content,
-        this.timestamp
-      ]
-    batching:
-      count: 500
-      period: 1s
-`,
-		).
-		Example(
-			"Insert JSON Documents",
-			"The following example inserts JSON documents into the table `footable` of the namespace `foospace` using Aerospike CDT.",
-			`
-output:
-  aerospike:
-    addresses:
-      - localhost:9042
-    query: 'INSERT INTO foospace.footable JSON ?'
-    args_mapping: 'root = [ this ]'
-    batching:
-      count: 500
-      period: 1s
-`,
-		).
-		Fields(clientFields()...).
-		Fields(
-			service.NewStringField(coFieldQuery).
-				Description("A query to execute for each message."),
-			service.NewBloblangField(coFieldArgsMapping).
-				Description("A [Bloblang mapping](/docs/guides/bloblang/about) that can be used to provide arguments to Aerospike insert. The result of the query must be an array containing a matching number of elements to the query arguments.").
-				Version("3.55.0").
-				Optional(),
-			service.NewStringEnumField(coFieldConsistency,
-				"ANY", "ONE", "TWO", "THREE", "QUORUM", "ALL", "LOCAL_QUORUM", "EACH_QUORUM", "LOCAL_ONE").
-				Description("The consistency level to use.").
-				Advanced().
-				Default("QUORUM"),
-			service.NewBoolField(coFieldLoggedBatch).
-				Description("If enabled the driver will perform a logged batch. Disabling this prompts unlogged batches to be used instead, which are less efficient but necessary for alternative storages that do not support logged batches.").
-				Advanced().
-				Default(true),
-			service.NewOutputMaxInFlightField(),
-			service.NewBatchPolicyField(coFieldBatching),
-		)
+` + connectionNameDescription() + authDescription()).
+		Fields(connectionHeadFields()...).
+		Field(service.NewInterpolatedStringField("subject").
+			Description("The set to publish to.").
+			Example("<namespace>.<set>")).
+		Field(service.NewInterpolatedStringMapField("headers").
+			Description("Explicit message headers to add to messages.").
+			Default(map[string]any{}).
+			Example(map[string]any{
+				"Timestamp": `${!meta("Timestamp")}`,
+			})).
+		Field(service.NewIntField("max_in_flight").
+			Description("The maximum number of messages to have in flight at a given time. Increase this to improve throughput.").
+			Default(64)).
+		Fields(connectionTailFields()...).
+		Field(outputTracingDocs())
+
 }
 
 func init() {
@@ -108,29 +71,144 @@ func init() {
 }
 
 type aerospikeWriter struct {
-	log *service.Logger
+	connDetails        connectionDetails
+	log                *service.Logger
+	policyHeader       map[string]interface{}
+	maxInFlight        int
+	subject            string
+	namespace          string
+	set                string
+	currentAsClient    *as.Client
+	recordExistsAction as.RecordExistsAction
+	commitLevel        as.CommitLevel
+	generationPolicy   as.GenerationPolicy
+	durableDelete      bool
+	sendKey            bool
+	interruptChan      chan struct{}
+	interruptOnce      sync.Once
 
-	query       string
-	clientConf  clientConf
 	argsMapping *bloblang.Executor
-	batchType   gocql.BatchType
-	consistency gocql.Consistency
-
-	session  *gocql.Session
-	connLock sync.RWMutex
+	connLock    sync.RWMutex
 }
 
 func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *aerospikeWriter, err error) {
 	c = &aerospikeWriter{
 		log: mgr.Logger(),
 	}
-
-	if c.query, err = conf.FieldString(coFieldQuery); err != nil {
-		return
+	//var err error
+	if c.connDetails, err = connectionDetailsFromParsed(conf, mgr); err != nil {
+		return nil, err
 	}
 
-	if c.clientConf, err = clientConfFromParsed(conf); err != nil {
-		return
+	//if c.query, err = conf.FieldString(coFieldQuery); err != nil {
+	//	return
+	//}
+
+	c.maxInFlight, err = conf.FieldMaxInFlight()
+	if err != nil {
+		return nil, err
+	}
+
+	if c.subject, err = conf.FieldString("subject"); err != nil {
+		return nil, err
+	}
+
+	if strings.Count(c.subject, ".") != 1 {
+		return nil, errors.New("subject must be in the form of <namespace>.<set>")
+	}
+
+	c.namespace = strings.Split(c.subject, ".")[0]
+	c.set = strings.Split(c.subject, ".")[1]
+
+	headers, err := conf.FieldInterpolatedStringMap("headers")
+	if err != nil {
+		return nil, err
+	}
+
+	//UPDATE RecordExistsAction = iota
+	//
+	//// UPDATE_ONLY means: Update record only. Fail if record does not exist.
+	//// Merge write command bins with existing bins.
+	//UPDATE_ONLY
+	//
+	//// REPLACE means: Create or replace record.
+	//// Delete existing bins not referenced by write command bins.
+	//// Supported by Aerospike 2 server versions >= 2.7.5 and
+	//// Aerospike 3 server versions >= 3.1.6 and later.
+	//REPLACE
+	//
+	//// REPLACE_ONLY means: Replace record only. Fail if record does not exist.
+	//// Delete existing bins not referenced by write command bins.
+	//// Supported by Aerospike 2 server versions >= 2.7.5 and
+	//// Aerospike 3 server versions >= 3.1.6 and later.
+	//REPLACE_ONLY
+	//
+	//// CREATE_ONLY means: Create only. Fail if record exists.
+	//CREATE_ONLY
+
+	val, ok := headers["record_exists_action"]
+	if ok {
+		s, isStatic := val.Static()
+		if !isStatic {
+
+		}
+		valInt, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse record_exists_action: %w", err)
+		}
+		c.recordExistsAction = as.RecordExistsAction(valInt)
+	}
+
+	val, ok = headers["commit_level"]
+	if ok {
+		s, isStatic := val.Static()
+		if !isStatic {
+
+		}
+		valInt, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse commit_level: %w", err)
+		}
+		c.commitLevel = as.CommitLevel(valInt)
+	}
+
+	val, ok = headers["generation_policy"]
+	if ok {
+		s, isStatic := val.Static()
+		if !isStatic {
+
+		}
+		valInt, err := strconv.Atoi(s)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse generation_policy: %w", err)
+		}
+		c.generationPolicy = as.GenerationPolicy(valInt)
+	}
+
+	val, ok = headers["durabe_delete"]
+	if ok {
+		s, isStatic := val.Static()
+		if !isStatic {
+
+		}
+		if strings.ToLower(s) == "true" {
+			c.durableDelete = true
+		} else {
+			c.durableDelete = false
+		}
+	}
+
+	val, ok = headers["send_key"]
+	if ok {
+		s, isStatic := val.Static()
+		if !isStatic {
+
+		}
+		if strings.ToLower(s) == "true" {
+			c.sendKey = true
+		} else {
+			c.sendKey = false
+		}
 	}
 
 	if aStr, _ := conf.FieldString(coFieldArgsMapping); aStr != "" {
@@ -139,79 +217,66 @@ func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *
 		}
 	}
 
-	c.batchType = gocql.UnloggedBatch
-	if loggedBatch, _ := conf.FieldBool(coFieldLoggedBatch); loggedBatch {
-		c.batchType = gocql.LoggedBatch
-	}
-
-	var consistencyStr string
-	if consistencyStr, err = conf.FieldString(coFieldConsistency); err != nil {
-		return
-	}
-	if c.consistency, err = gocql.ParseConsistencyWrapper(consistencyStr); err != nil {
-		return nil, fmt.Errorf("parsing consistency: %w", err)
-	}
-
 	return
 }
 
 func (c *aerospikeWriter) Connect(ctx context.Context) error {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
-	if c.session != nil {
-		return nil
-	}
 
-	conn, err := c.clientConf.Create()
-	if err != nil {
+	//if n.natsConn != nil {
+	//	return nil
+	//}
+
+	var asClient *as.Client
+	//var natsSub *nats.Subscription
+	var err error
+
+	if asClient, err = c.connDetails.get(ctx); err != nil {
 		return err
 	}
-	conn.Consistency = c.consistency
 
-	session, err := conn.CreateSession()
-	if err != nil {
-		return fmt.Errorf("creating Cassandra session: %w", err)
-	}
+	c.currentAsClient = asClient
 
-	c.session = session
 	return nil
 }
 
 func (c *aerospikeWriter) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
 	c.connLock.RLock()
-	session := c.session
+
 	c.connLock.RUnlock()
 
-	if c.session == nil {
+	if c.currentAsClient == nil {
 		return service.ErrNotConnected
 	}
 
 	if len(batch) == 1 {
-		return c.writeRow(session, batch)
+		return c.writeRow(batch)
 	}
-	return c.writeBatch(session, batch)
+	return c.writeBatch(c.currentAsClient, batch)
 }
 
-func (c *aerospikeWriter) writeRow(session *gocql.Session, b service.MessageBatch) error {
+func (c *aerospikeWriter) writeRow(b service.MessageBatch) error {
 	values, err := c.mapArgs(b, 0)
 	if err != nil {
 		return fmt.Errorf("parsing args: %w", err)
 	}
-	return session.Query(c.query, values...).Exec()
+
+	msg := values[0].(*service.Message)
+	return c.writeAerospikeRecordFromMessage(msg)
 }
 
-func (c *aerospikeWriter) writeBatch(session *gocql.Session, b service.MessageBatch) error {
-	batch := session.NewBatch(c.batchType)
+func (c *aerospikeWriter) writeBatch(client *as.Client, b service.MessageBatch) error {
 
 	for i := range b {
 		values, err := c.mapArgs(b, i)
+		msg := values[0].(*service.Message)
+		err = c.writeAerospikeRecordFromMessage(msg)
 		if err != nil {
-			return fmt.Errorf("parsing args for part: %d: %w", i, err)
+			return err
 		}
-		batch.Query(c.query, values...)
 	}
-
-	return session.ExecuteBatch(batch)
+	return nil
 }
 
 func (c *aerospikeWriter) mapArgs(b service.MessageBatch, index int) ([]any, error) {
@@ -242,12 +307,18 @@ func (c *aerospikeWriter) mapArgs(b service.MessageBatch, index int) ([]any, err
 
 func (c *aerospikeWriter) Close(context.Context) error {
 	c.connLock.Lock()
-	if c.session != nil {
-		c.session.Close()
-		c.session = nil
-	}
+	go func() {
+		c.disconnect()
+	}()
+	c.interruptOnce.Do(func() {
+		close(c.interruptChan)
+	})
 	c.connLock.Unlock()
 	return nil
+}
+
+type genericValue struct {
+	v any
 }
 
 type decorator struct {
@@ -275,62 +346,56 @@ func getExponentialTime(min, max time.Duration, attempts int) time.Duration {
 	return time.Duration(napDuration)
 }
 
-func (d *decorator) GetRetryType(err error) gocql.RetryType {
-	switch t := err.(type) {
-	// not enough replica alive to perform query with required consistency
-	case *gocql.RequestErrUnavailable:
-		if t.Alive > 0 {
-			return gocql.RetryNextHost
-		}
-		return gocql.Retry
-	// write timeout - uncertain whetever write was successful or not
-	case *gocql.RequestErrWriteTimeout:
-		if t.Received > 0 {
-			return gocql.Ignore
-		}
-		return gocql.Retry
-	default:
-		return gocql.Rethrow
+func (c *aerospikeWriter) writeAerospikeRecordFromMessage(msg *service.Message) error {
+	var binMap as.BinMap
+	var key *as.Key
+	err := msg.MetaWalkMut(func(k string, v any) error {
+		binMap[k] = v
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to walk: %w", err)
 	}
+
+	gen, bFound := msg.MetaGetMut("generation")
+	if bFound == false {
+		gen = 0
+	}
+
+	exp, bFound := msg.MetaGetMut("expiration")
+	if bFound == false {
+		exp = 0
+	}
+
+	id, bFound := msg.MetaGetMut("id")
+
+	policy := as.NewWritePolicy(gen.(uint32), exp.(uint32))
+	policy.SendKey = c.sendKey
+	policy.RecordExistsAction = c.recordExistsAction
+	policy.CommitLevel = c.commitLevel
+	policy.GenerationPolicy = c.generationPolicy
+	policy.DurableDelete = c.durableDelete
+
+	key, err = as.NewKey(c.namespace, c.set, id)
+	if err != nil {
+		return fmt.Errorf("failed to create key: %w", err)
+	}
+
+	err = c.currentAsClient.Put(policy, key, binMap)
+	if err != nil {
+		return fmt.Errorf("failed to write row: %w", err)
+	}
+	return nil
+
 }
 
-type genericValue struct {
-	v any
-}
+func (c *aerospikeWriter) disconnect() {
+	c.connLock.Lock()
+	defer c.connLock.Unlock()
 
-// We get typed values out of mappings. However, gocql performs type checking
-// and unfortunately does not like timestamp and some other values as strings:
-// https://github.com/gocql/gocql/blob/5913df4d474e0b2492a129d17bbb3c04537a15cd/marshal.go#L1160
-// it's also very strict on numerical types, so we need to do some magic here.
-func (g genericValue) MarshalCQL(info gocql.TypeInfo) ([]byte, error) {
-	switch info.Type() {
-	case gocql.TypeTimestamp:
-		t, err := bloblang.ValueAsTimestamp(g.v)
-		if err != nil {
-			return nil, err
-		}
-		return gocql.Marshal(info, t)
-	case gocql.TypeDouble:
-		f, err := bloblang.ValueAsFloat64(g.v)
-		if err != nil {
-			return nil, err
-		}
-		return gocql.Marshal(info, f)
-	case gocql.TypeFloat:
-		f, err := bloblang.ValueAsFloat32(g.v)
-		if err != nil {
-			return nil, err
-		}
-		return gocql.Marshal(info, f)
-	case gocql.TypeVarchar:
-		return gocql.Marshal(info, bloblang.ValueToString(g.v))
+	if c.currentAsClient != nil {
+		c.currentAsClient = nil
 	}
-	if _, isJSONNum := g.v.(json.Number); isJSONNum {
-		i, err := bloblang.ValueAsInt64(g.v)
-		if err != nil {
-			return nil, err
-		}
-		return gocql.Marshal(info, i)
-	}
-	return gocql.Marshal(info, g.v)
+	c.currentAsClient = nil
 }
