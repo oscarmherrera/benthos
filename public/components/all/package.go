@@ -5,6 +5,7 @@ package all
 
 import (
 	// Import all public sub-categories.
+	_ "github.com/benthosdev/benthos/v4/public/components/aerospike"
 	_ "github.com/benthosdev/benthos/v4/public/components/amqp09"
 	_ "github.com/benthosdev/benthos/v4/public/components/amqp1"
 	_ "github.com/benthosdev/benthos/v4/public/components/avro"

@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	kvFieldBucket = "set"
+	kvFieldBucket = "namespace.set"
 )
 
 const (

@@ -60,13 +60,13 @@ func connectionDetailsFromParsed(conf *service.ParsedConfig, mgr *service.Resour
 		var hostList []string
 		if hostList, err = conf.FieldStringList("hosts"); err != nil {
 			err = errors.New("seed host list is empty")
-			return
+			return c, err
 		}
 		for _, host := range hostList {
-			addr, err := net.ResolveTCPAddr("tcp", host)
-			if err != nil {
-				err = fmt.Errorf("unable to parse host %s: %v", host, err)
-				return
+			addr, err2 := net.ResolveTCPAddr("tcp", host)
+			if err2 != nil {
+				err2 = fmt.Errorf("unable to parse host %s: %v", host, err2)
+				return c, err
 			}
 			if addr.Port == 0 {
 				// Use default port

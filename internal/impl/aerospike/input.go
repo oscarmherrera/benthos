@@ -8,58 +8,55 @@ import (
 	"sync"
 	"time"
 
-	"github.com/nats-io/nats.go"
-
 	"github.com/benthosdev/benthos/v4/internal/component/input/span"
 	"github.com/benthosdev/benthos/v4/public/service"
 )
 
-func aerospikeInputConfig() *service.ConfigSpec {
-	return service.NewConfigSpec().
-		Stable().
+const (
+	asFieldQuery = "query"
+	asBins       = "bins"
+	asSet        = "set"
+)
+
+func inputConfigSpec() *service.ConfigSpec {
+	spec := service.NewConfigSpec().
 		Categories("Services").
-		Summary(`Subscribe to a Aerospike subject=<namespace>.<set>`).
-		Description(`
-### Metadata
+		Summary("Executes a query on an aerospike set and creates a message for each row received.").
+		Description("A query to execute.").
+		Fields(
+			//service.NewStringField(asFieldQuery),
+			service.NewObjectField(asFieldQuery,
+				service.NewStringField(asSet).
+					Description("The set to execute the query on"),
+				service.NewStringListField(asBins).
+					Description("The bins to retrieve from the set, if there is no bin list all bins will be retrieved").
+					Optional(),
+			)).
+		Example("Minimal query for Aerospike",
+			`
+Let's presume that we have 3 Aerospike nodes:
+`,
+			`
+input:
+  aerospike:
+    addresses:
+      - 172.17.0.2
+    query:
+		bins:
+		  - foo
+		  - bar
+		  - zoo
+`,
+		)
 
-This input adds the following metadata fields to each message:
-
-` + "``` text" + `
-- aerospike_subject
-- aerospike_reply_subject
-- All message headers (when supported by the connection)
-` + "```" + `
-
-You can access these metadata fields using [function interpolation](/docs/configuration/interpolation#bloblang-queries).
-
-` + connectionNameDescription() + authDescription()).
-		Fields(connectionHeadFields()...).
-		Field(service.NewStringField("subject").
-			Description("A subject to consume from. Supports wildcards for consuming multiple subjects. Either a subject or stream must be specified.").
-			Example("foo.bar.baz").Example("foo.*.baz").Example("foo.bar.*").Example("foo.>")).
-		Field(service.NewStringField("queue").
-			Description("An optional queue group to consume as.").
-			Optional()).
-		Field(service.NewAutoRetryNacksToggleField()).
-		Field(service.NewDurationField("nak_delay").
-			Description("An optional delay duration on redelivering a message when negatively acknowledged.").
-			Example("1m").
-			Advanced().
-			Optional()).
-		Field(service.NewIntField("prefetch_count").
-			Description("The maximum number of messages to pull at a time.").
-			Advanced().
-			Default(nats.DefaultSubPendingMsgsLimit).
-			LintRule(`root = if this < 0 { ["prefetch count must be greater than or equal to zero"] }`)).
-		Fields(connectionTailFields()...).
-		Field(inputTracingDocs())
+	return spec
 }
 
 func init() {
 	err := service.RegisterInput(
-		"aerospike", aerospikeInputConfig(),
+		"aerospike", inputConfigSpec(),
 		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
-			input, err := newAerospikeReader(conf, mgr)
+			input, err := newAerospikeInput(conf, mgr)
 			if err != nil {
 				return nil, err
 			}
@@ -68,7 +65,7 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return span.NewInput("nats", conf, r, mgr)
+			return span.NewInput("aerospike", conf, r, mgr)
 		},
 	)
 	if err != nil {
@@ -96,7 +93,7 @@ type aerospikeInput struct {
 	recordSet       *as.Recordset
 }
 
-func newAerospikeReader(conf *service.ParsedConfig, mgr *service.Resources) (*aerospikeInput, error) {
+func newAerospikeInput(conf *service.ParsedConfig, mgr *service.Resources) (*aerospikeInput, error) {
 	n := aerospikeInput{
 		log:           mgr.Logger(),
 		interruptChan: make(chan struct{}),
@@ -174,7 +171,10 @@ func (a *aerospikeInput) disconnect() {
 	defer a.cMut.Unlock()
 
 	if a.recordSet != nil {
-		a.recordSet.Close()
+		err := a.recordSet.Close()
+		if err != nil {
+			a.log.Errorf("Failed to close recordset: %v", err)
+		}
 		a.recordSet = nil
 	}
 	if a.currentAsClient != nil {
@@ -206,12 +206,12 @@ func (a *aerospikeInput) Read(ctx context.Context) (*service.Message, service.Ac
 	}, nil
 }
 
-func (n *aerospikeInput) Close(ctx context.Context) (err error) {
+func (a *aerospikeInput) Close(ctx context.Context) (err error) {
 	go func() {
-		n.disconnect()
+		a.disconnect()
 	}()
-	n.interruptOnce.Do(func() {
-		close(n.interruptChan)
+	a.interruptOnce.Do(func() {
+		close(a.interruptChan)
 	})
 	return
 }
