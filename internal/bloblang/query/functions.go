@@ -688,7 +688,8 @@ root.sixth = random_int(seed:timestamp_unix_nano(), max:20)
 		),
 		NewExampleSpec("It is possible to specify a dynamic seed argument, in which case the argument will only be resolved once during the lifetime of the mapping.",
 			`root.first = random_int(timestamp_unix_nano())`,
-			`root.second = random_int(timestamp_unix_nano(), 5, 20)`,
+			`root.second = ran
+om_int(timestamp_unix_nano(), 5, 20)`,
 		),
 	).
 		Param(ParamQuery(

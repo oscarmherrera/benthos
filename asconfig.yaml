@@ -1,0 +1,87 @@
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+  root_path: /benthos
+  debug_endpoints: true
+  cert_file: ""
+  key_file: ""
+  cors:
+    enabled: false
+    allowed_origins: []
+  basic_auth:
+    enabled: false
+    realm: restricted
+    username: ""
+    password_hash: ""
+    algorithm: sha256
+    salt: ""
+input:
+  csv:
+    paths:
+      - ../globallandtemperaturesbymajorcity.csv
+#      - ../globaltemperatures.csv
+    parse_header_row: true
+    delimiter: ','
+    lazy_quotes: false
+    auto_replay_nacks: true
+buffer:
+  none: {}
+pipeline:
+  threads: -1
+  processors:
+    - mapping: |
+        meta key = this.dt.ts_parse("2006-01-02").ts_format() + "-" + this.city + "-" + this.country
+    - label: climate_data
+      bloblang: |
+        root = this
+    - label: process_data
+      aerospike:
+        hosts:
+          - 10.211.55.102:3000
+          - 10.211.55.103:3000
+          - 10.211.55.104:3000
+        auth:
+          auth_mode: 0
+          username: "admin"
+          password: "admin123"
+        operation: "create"
+        namespace.set: "test.oscar_test"
+        query:
+          set: test.oscar_test
+          bins:
+            - "date"
+            - "averagetemperature"
+            - "averagetemperatureuncertainty"
+            - "city"
+            - "country"
+            - "latitude"
+            - "longitude"
+output:
+  stdout: {}
+input_resources: []
+processor_resources: []
+output_resources: []
+cache_resources: []
+rate_limit_resources: []
+logger:
+  level: DEBUG
+  format: logfmt
+  add_timestamp: true
+  level_name: level
+  timestamp_name: time
+  message_name: msg
+  static_fields:
+    '@service': benthos
+  file:
+    path: ""
+    rotate: false
+    rotate_max_age_days: 0
+metrics:
+  prometheus: {}
+  mapping: ""
+tracer:
+  none: {}
+shutdown_delay: 0s
+shutdown_timeout: 20s
+tests: []
+

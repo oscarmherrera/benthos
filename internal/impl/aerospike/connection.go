@@ -73,7 +73,7 @@ func connectionDetailsFromParsed(conf *service.ParsedConfig, mgr *service.Resour
 				addr.Port = 3000
 			}
 			asHost := as.NewHost(addr.IP.String(), addr.Port)
-			asHost.TLSName = "benthos pipeline"
+			//asHost.TLSName = "benthos pipeline"
 			c.hosts = append(c.hosts, asHost)
 
 		}
@@ -100,12 +100,16 @@ func (c *connectionDetails) get(_ context.Context) (*as.Client, error) {
 
 	policy := as.NewClientPolicy()
 	policy.MinConnectionsPerNode = c.minConnectionPerNode
-	policy.ConnectionQueueSize = c.queueSize
+	if c.queueSize > 0 {
+		policy.ConnectionQueueSize = c.queueSize
+	}
+
 	//policy.ConnectionQueueSize = 5
 	policy.LimitConnectionsToQueueSize = true
 	policy.OpeningConnectionThreshold = 0 //No limit
 	policy.TendInterval = 1 * time.Second // Default
 	policy.IdleTimeout = 1 * time.Minute
+	policy.LoginTimeout = 60 * time.Second
 
 	//authVars = config.ASAuth
 	policy.User = c.authConf.Username

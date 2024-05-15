@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	as "github.com/aerospike/aerospike-client-go/v6"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,7 +17,7 @@ import (
 const (
 	kvpFieldOperation = "operation"
 	kvpFieldKey       = "key"
-	kvpFieldRevision  = "revision"
+	kvpFieldRevision  = "generation"
 	kvpFieldTimeout   = "timeout"
 )
 
@@ -76,7 +75,7 @@ This processor adds the following metadata fields to each message, depending on 
 - aerospike_key
 - aerospike_expiration
 - aerospike_durable_delete
-- nats_kv_operation
+- aerospike_kv_operation
 ` + "```" + `
 
 #### keys
@@ -90,19 +89,28 @@ This processor adds the following metadata fields to each message, depending on 
 				Description("The operation to perform on the KV set."),
 			service.NewStringField(kvFieldBucket).
 				Description("The fully qualified name of the <namespace>.<set> to interact with."),
-			service.NewInterpolatedStringField(kvpFieldKey).
-				Description("The key for each message. Supports [wildcards](https://docs.nats.io/nats-concepts/subjects#wildcards) for the `history` and `keys` operations.").
-				Example("foo").
-				Example("foo.bar.baz").
-				Example("foo.*").
-				Example("foo.>").
-				Example(`foo.${! json("meta.type") }`).LintRule(`if this == "" {[ "'key' must be set to a non-empty string" ]}`),
-			service.NewInterpolatedStringField(kvpFieldRevision).
-				Description("The revision of the key to operate on. Used for `get_revision` and `update` operations.").
-				Example("42").
-				Example(`${! @nats_kv_revision }`).
-				Optional().
-				Advanced(),
+			//service.NewInterpolatedStringField(kvpFieldKey).
+			//	Description("The key for each message. Supports [wildcards](https://docs.nats.io/nats-concepts/subjects#wildcards) for the `history` and `keys` operations.").
+			//	Example("foo").
+			//	Example("foo.bar.baz").
+			//	Example("foo.*").
+			//	Example("foo.>").
+			//	Example(`foo.${! json("meta.type") }`).LintRule(`if this == "" {[ "'key' must be set to a non-empty string" ]}`),
+
+			//Fields(
+			//service.NewStringField(asFieldQuery),
+			service.NewObjectField(asFieldQuery,
+				service.NewStringField(asSet).
+					Description("The set to execute the query on"),
+				service.NewStringListField(asBins).
+					Description("The bins to retrieve from the set, if there is no bin list all bins will be retrieved").
+					Optional(),
+			),
+			//)).
+			service.NewIntField(kvpFieldRevision).
+				Description("The revision to use for the `update or get` operation when using MRT in the future.").
+				Default(-1).Optional(),
+
 			service.NewDurationField(kvpFieldTimeout).
 				Description("The maximum period to wait on an operation before aborting and returning an error.").
 				Advanced().Default("5s"),
@@ -131,8 +139,8 @@ type kvProcessor struct {
 	namespace       string
 	set             string
 	operation       kvpOperationType
-	key             *service.InterpolatedString
-	revision        *service.InterpolatedString
+	key             any //*service.InterpolatedString
+	revision        int // -1 means latest
 	timeout         time.Duration
 
 	log *service.Logger
@@ -166,12 +174,12 @@ func newKVProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*kvProc
 		p.operation = kvpOperationType(operation)
 	}
 
-	if p.key, err = conf.FieldInterpolatedString(kvpFieldKey); err != nil {
-		return nil, err
-	}
+	//if p.key, err = conf.FieldInterpolatedString(kvpFieldKey); err != nil {
+	//	return nil, err
+	//}
 
 	if conf.Contains(kvpFieldRevision) {
-		if p.revision, err = conf.FieldInterpolatedString(kvpFieldRevision); err != nil {
+		if p.revision, err = conf.FieldInt(kvpFieldRevision); err != nil {
 			return nil, err
 		}
 	}
@@ -216,11 +224,23 @@ type aerospikeMsg struct {
 func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (service.MessageBatch, error) {
 	p.connMut.Lock()
 	//kv := p.kv
-	p.connMut.Unlock()
+	defer p.connMut.Unlock()
+	var key any
+	var err error
 
-	key, err := p.key.TryString(msg)
-	if err != nil {
-		return nil, err
+	//Check if there is an error in the message
+	if msg.GetError() != nil {
+		return nil, msg.GetError()
+	}
+
+	if p.key == nil {
+		var bFound bool
+		key, bFound = msg.MetaGetMut(kvpFieldKey)
+		if bFound == true {
+			p.key = key
+		}
+	} else {
+		key = p.key
 	}
 
 	bytes, err := msg.AsBytes()
@@ -272,10 +292,14 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 		return service.MessageBatch{m}, nil
 
 	case kvpOperationUpdate:
-		revision, err := p.parseRevision(msg)
+		revision := p.revision
 		if err != nil {
 			return nil, err
 		}
+		if revision == -1 {
+			revision = 0 // because we are using the default values
+		}
+
 		rev, err := Update(ctx, p, key, uint32(revision), bytes)
 		if err != nil {
 			return nil, err
@@ -364,16 +388,16 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 	}
 }
 
-func (p *kvProcessor) parseRevision(msg *service.Message) (uint64, error) {
-	revStr, err := p.revision.TryString(msg)
-	if err != nil {
-		return 0, err
-	}
+//func (p *kvProcessor) parseRevision(msg *service.Message) (uint64, error) {
+//	revStr, err := p.revision.TryString(msg)
+//	if err != nil {
+//		return 0, err
+//	}
+//
+//	return strconv.ParseUint(revStr, 10, 64)
+//}
 
-	return strconv.ParseUint(revStr, 10, 64)
-}
-
-func (p *kvProcessor) addMetadata(msg *service.Message, key string, revision uint64, operation kvpOperationType) {
+func (p *kvProcessor) addMetadata(msg *service.Message, key any, revision uint64, operation kvpOperationType) {
 	msg.MetaSetMut(metaKVKey, key)
 	msg.MetaSetMut(metaKVNamespace, p.namespace)
 	msg.MetaSetMut(metaKVSet, p.set)
