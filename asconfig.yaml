@@ -42,7 +42,7 @@ pipeline:
           - 10.211.55.104:3000
         auth:
           auth_mode: 0
-          username: "admin"
+          username: "oscar"
           password: "admin123"
         operation: "create"
         namespace.set: "test.oscar_test"
