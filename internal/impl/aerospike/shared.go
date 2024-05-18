@@ -5,9 +5,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/aerospike/aerospike-client-go/v6"
+	"github.com/benthosdev/benthos/v4/public/service"
+	"time"
 )
 
-func Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
+type aerospikeMsgData struct {
+	log                *service.Logger
+	connDetails        connectionDetails
+	namespace          string
+	set                string
+	operation          kvpOperationType
+	recordExistsAction aerospike.RecordExistsAction
+	commitLevel        aerospike.CommitLevel
+	generationPolicy   aerospike.GenerationPolicy
+	durableDelete      bool
+	sendKey            bool
+	timeout            time.Duration
+}
+
+func (a *aerospikeMsgData) Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
 	policy := aerospike.NewPolicy()
 	policy.SendKey = true
 	var err error
@@ -18,28 +34,28 @@ func Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
 	switch v := value.(type) {
 	case aerospike.IntegerValue:
 		iKey := int(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, iKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, iKey)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create integer key: %s", err)
 		}
 	case aerospike.StringValue:
 		sKey := string(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, sKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, sKey)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create string key: %s", err)
 		}
 	case aerospike.BytesValue:
 		bvKey := []byte(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, bvKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, bvKey)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create byte array key: %s", err)
 		}
 	default:
-		return nil, fmt.Errorf("unsupported user key type %T", v)
 		asKey = nil
+		return nil, fmt.Errorf("unsupported user key type %T", v)
 	}
 
-	record, err := p.currentAsClient.Get(policy, asKey)
+	record, err := p.aerospikeDetails.connDetails.asClient.Get(policy, asKey)
 
 	if err != nil {
 		return nil, err
@@ -57,8 +73,8 @@ func Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
 	msg := &aerospikeMsg{
 		Value:      msgValue,
 		Key:        record.Key,
-		Namespace:  p.namespace,
-		Set:        p.set,
+		Namespace:  a.namespace,
+		Set:        a.set,
 		Generation: int32(record.Generation),
 		Expiration: int32(record.Expiration),
 		Operation:  string(kvpOperationGet),
@@ -67,19 +83,19 @@ func Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
 	return msg, nil
 }
 
-func Create(ctx context.Context, p *kvProcessor, key any, msgBytes []byte) (uint32, error) {
-	return put(ctx, p, aerospike.CREATE_ONLY, key, 0, msgBytes)
+func (a *aerospikeMsgData) Create(ctx context.Context, key any, msgBytes []byte) (uint32, error) {
+	return a.put(ctx, aerospike.CREATE_ONLY, key, 0, msgBytes)
 }
 
-func Put(ctx context.Context, p *kvProcessor, key any, msgBytes []byte) (uint32, error) {
-	return put(ctx, p, aerospike.REPLACE, key, 0, msgBytes)
+func (a *aerospikeMsgData) Put(ctx context.Context, key any, msgBytes []byte) (uint32, error) {
+	return a.put(ctx, aerospike.REPLACE, key, 0, msgBytes)
 }
 
-func Update(ctx context.Context, p *kvProcessor, key any, gen uint32, msgBytes []byte) (uint32, error) {
-	return put(ctx, p, aerospike.UPDATE, key, gen, msgBytes)
+func (a *aerospikeMsgData) Update(ctx context.Context, key any, gen uint32, msgBytes []byte) (uint32, error) {
+	return a.put(ctx, aerospike.UPDATE, key, gen, msgBytes)
 }
 
-func Delete(ctx context.Context, p *kvProcessor, key any) error {
+func (a *aerospikeMsgData) Delete(ctx context.Context, key any) error {
 	policy := aerospike.NewWritePolicy(0, 0)
 	policy.SendKey = true
 	policy.DurableDelete = true
@@ -92,38 +108,38 @@ func Delete(ctx context.Context, p *kvProcessor, key any) error {
 	switch v := value.(type) {
 	case aerospike.IntegerValue:
 		iKey := int(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, iKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, iKey)
 		if err != nil {
 			return fmt.Errorf("unable to create integer key: %s", err)
 		}
 	case aerospike.StringValue:
 		sKey := string(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, sKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, sKey)
 		if err != nil {
 			return fmt.Errorf("unable to create string key: %s", err)
 		}
 	case aerospike.BytesValue:
 		bvKey := []byte(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, bvKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, bvKey)
 		if err != nil {
 			return fmt.Errorf("unable to create byte array key: %s", err)
 		}
 	default:
-		return fmt.Errorf("unsupported user key type %T", v)
 		asKey = nil
+		return fmt.Errorf("unsupported user key type %T", v)
 	}
 
-	recordExisted, err := p.currentAsClient.Delete(policy, asKey)
+	recordExisted, err := a.connDetails.asClient.Delete(policy, asKey)
 	if err != nil {
 		return err
 	}
 	if !recordExisted {
-		p.log.Warnf("Record with key %v does not exist", key)
+		a.log.Warnf("Record with key %v does not exist", key)
 	}
 	return nil
 }
 
-func put(ctx context.Context, p *kvProcessor, action aerospike.RecordExistsAction, key any, gen uint32, msgBytes []byte) (uint32, error) {
+func (a *aerospikeMsgData) put(ctx context.Context, action aerospike.RecordExistsAction, key any, gen uint32, msgBytes []byte) (uint32, error) {
 	policy := aerospike.NewWritePolicy(gen, 0)
 	policy.SendKey = true
 	policy.DurableDelete = true
@@ -138,25 +154,25 @@ func put(ctx context.Context, p *kvProcessor, action aerospike.RecordExistsActio
 	switch v := value.(type) {
 	case aerospike.IntegerValue:
 		iKey := int(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, iKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, iKey)
 		if err != nil {
 			return 0, fmt.Errorf("unable to create integer key: %s", err)
 		}
 	case aerospike.StringValue:
 		sKey := string(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, sKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, sKey)
 		if err != nil {
 			return 0, fmt.Errorf("unable to create string key: %s", err)
 		}
 	case aerospike.BytesValue:
 		bvKey := []byte(v)
-		asKey, err = aerospike.NewKey(p.namespace, p.set, bvKey)
+		asKey, err = aerospike.NewKey(a.namespace, a.set, bvKey)
 		if err != nil {
 			return 0, fmt.Errorf("unable to create byte array key: %s", err)
 		}
 	default:
-		return 0, fmt.Errorf("unsupported user key type %T", v)
 		asKey = nil
+		return 0, fmt.Errorf("unsupported user key type %T", v)
 	}
 
 	msgValue, err := convertByteArrayToBinMap(msgBytes)
@@ -167,16 +183,17 @@ func put(ctx context.Context, p *kvProcessor, action aerospike.RecordExistsActio
 	var binMap *aerospike.BinMap
 	binMap = (*aerospike.BinMap)(msgValue)
 
-	err = p.currentAsClient.Put(policy, asKey, *binMap)
+	err = a.connDetails.asClient.Put(policy, asKey, *binMap)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("unable to put record: %s, %v", err, asKey)
 	}
+	a.log.Debug(fmt.Sprintf("Put record with key %v", key))
 
 	// Go get th current revision of the record
 	readPolicy := aerospike.NewPolicy()
-	record, err := p.currentAsClient.GetHeader(readPolicy, asKey)
+	record, err := a.connDetails.asClient.GetHeader(readPolicy, asKey)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("unable to get record header: %s", err)
 	}
 	return record.Generation, nil
 }

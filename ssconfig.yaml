@@ -17,14 +17,12 @@ http:
     salt: ""
 
 input:
-  csv:
-    paths:
-      - ../globallandtemperaturesbymajorcity.csv
-#      - ../globaltemperatures.csv
-    parse_header_row: true
-    delimiter: ','
-    lazy_quotes: false
-    auto_replay_nacks: true
+  http_server:
+    path: /syncserver
+    allowed_verbs: [ GET, POST ]
+    sync_response:
+      headers:
+        Content-Type: application/json
 buffer:
   none: {}
 pipeline:
@@ -42,30 +40,43 @@ pipeline:
         root.country = this.country
         root.latitude = this.latitude
         root.longitude = this.longitude
-#        this = root
-    - label: process_data
-      aerospike:
-        hosts:
-          - 10.211.55.102:3000
-          - 10.211.55.103:3000
-          - 10.211.55.104:3000
-        auth:
-          auth_mode: 0
-          username: "oscar"
-          password: "admin123"
-        operation: "create"
-        namespace.set: "test.oscar_test"
-        query:
-          set: test.oscar_test
-          bins:
-            - "date"
-            - "averagetemperature"
-            - "averagetemperatureuncertainty"
-            - "city"
-            - "country"
-            - "latitude"
-            - "longitude"
+
+#    - label: process_data
+#      aerospike:
+#        hosts:
+#          - 10.211.55.102:3000
+#          - 10.211.55.103:3000
+#          - 10.211.55.104:3000
+#        auth:
+#          auth_mode: 0
+#          username: "oscar"
+#          password: "admin123"
+#        operation: "create"
+#        namespace.set: "test.oscar_test"
+#        query:
+#          set: test.oscar_test
+#          bins:
+#            - "date"
+#            - "averagetemperature"
+#            - "averagetemperatureuncertainty"
+#            - "city"
+#            - "country"
+#            - "latitude"
+#            - "longitude"
 output:
+  label: aerospike_store
+  aerospike:
+    hosts:
+      - 10.211.55.102:3000
+      - 10.211.55.103:3000
+      - 10.211.55.104:3000
+    auth:
+      auth_mode: 0
+      username: "oscar"
+      password: "admin123"
+    operation: "create"
+    namespace.set: "test.oscar_test"
+
   stdout: {}
 input_resources: []
 processor_resources: []

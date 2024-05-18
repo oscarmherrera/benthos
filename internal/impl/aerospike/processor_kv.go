@@ -4,21 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Jeffail/shutdown"
 	as "github.com/aerospike/aerospike-client-go/v6"
 	"strings"
 	"sync"
-	"time"
-
-	"github.com/Jeffail/shutdown"
 
 	"github.com/benthosdev/benthos/v4/public/service"
 )
 
 const (
 	kvpFieldOperation = "operation"
-	kvpFieldKey       = "key"
-	kvpFieldRevision  = "generation"
-	kvpFieldTimeout   = "timeout"
+	//kvpFieldKey       = "key"
+	kvpFieldRevision = "generation"
+	kvpFieldTimeout  = "timeout"
 )
 
 type kvpOperationType string
@@ -89,15 +87,7 @@ This processor adds the following metadata fields to each message, depending on 
 				Description("The operation to perform on the KV set."),
 			service.NewStringField(kvFieldBucket).
 				Description("The fully qualified name of the <namespace>.<set> to interact with."),
-			//service.NewInterpolatedStringField(kvpFieldKey).
-			//	Description("The key for each message. Supports [wildcards](https://docs.nats.io/nats-concepts/subjects#wildcards) for the `history` and `keys` operations.").
-			//	Example("foo").
-			//	Example("foo.bar.baz").
-			//	Example("foo.*").
-			//	Example("foo.>").
-			//	Example(`foo.${! json("meta.type") }`).LintRule(`if this == "" {[ "'key' must be set to a non-empty string" ]}`),
 
-			//Fields(
 			//service.NewStringField(asFieldQuery),
 			service.NewObjectField(asFieldQuery,
 				service.NewStringField(asSet).
@@ -106,7 +96,15 @@ This processor adds the following metadata fields to each message, depending on 
 					Description("The bins to retrieve from the set, if there is no bin list all bins will be retrieved").
 					Optional(),
 			),
-			//)).
+
+			service.NewInterpolatedStringMapField("headers").
+				Description("Explicit message headers to add to messages.").
+				Default(map[string]any{}).
+				Advanced().Optional().
+				Example(map[string]any{
+					"Timestamp": `${!meta("Timestamp")}`,
+				}),
+
 			service.NewIntField(kvpFieldRevision).
 				Description("The revision to use for the `update or get` operation when using MRT in the future.").
 				Default(-1).Optional(),
@@ -134,33 +132,23 @@ func init() {
 }
 
 type kvProcessor struct {
-	connDetails     connectionDetails
-	currentAsClient *as.Client
-	namespace       string
-	set             string
-	operation       kvpOperationType
-	key             any //*service.InterpolatedString
-	revision        int // -1 means latest
-	timeout         time.Duration
-
-	log *service.Logger
-
-	shutSig *shutdown.Signaller
-	//
-	connMut sync.Mutex
-	//natsConn *nats.Conn
-	//kv       jetstream.KeyValue
+	aerospikeDetails *aerospikeMsgData
+	revision         int // -1 means latest
+	shutSig          *shutdown.Signaller
+	connMut          sync.Mutex
 }
 
 func newKVProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*kvProcessor, error) {
 	p := &kvProcessor{
-		log:     mgr.Logger(),
+		aerospikeDetails: &aerospikeMsgData{
+			log: mgr.Logger(),
+		},
 		shutSig: shutdown.NewSignaller(),
 	}
 
 	var subject string
 	var err error
-	if p.connDetails, err = connectionDetailsFromParsed(conf, mgr); err != nil {
+	if p.aerospikeDetails.connDetails, err = connectionDetailsFromParsed(conf, mgr); err != nil {
 		return nil, err
 	}
 
@@ -171,7 +159,7 @@ func newKVProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*kvProc
 	if operation, err := conf.FieldString(kvpFieldOperation); err != nil {
 		return nil, err
 	} else {
-		p.operation = kvpOperationType(operation)
+		p.aerospikeDetails.operation = kvpOperationType(operation)
 	}
 
 	//if p.key, err = conf.FieldInterpolatedString(kvpFieldKey); err != nil {
@@ -184,7 +172,7 @@ func newKVProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*kvProc
 		}
 	}
 
-	if p.timeout, err = conf.FieldDuration(kvpFieldTimeout); err != nil {
+	if p.aerospikeDetails.timeout, err = conf.FieldDuration(kvpFieldTimeout); err != nil {
 		return nil, err
 	}
 
@@ -192,8 +180,8 @@ func newKVProcessor(conf *service.ParsedConfig, mgr *service.Resources) (*kvProc
 		return nil, errors.New("subject must be in the form of <namespace>.<set>")
 	}
 
-	p.namespace = strings.Split(subject, ".")[0]
-	p.set = strings.Split(subject, ".")[1]
+	p.aerospikeDetails.namespace = strings.Split(subject, ".")[0]
+	p.aerospikeDetails.set = strings.Split(subject, ".")[1]
 
 	err = p.Connect(context.Background())
 	return p, err
@@ -203,10 +191,10 @@ func (p *kvProcessor) disconnect() {
 	p.connMut.Lock()
 	defer p.connMut.Unlock()
 
-	if p.currentAsClient != nil {
-		p.currentAsClient = nil
+	if p.aerospikeDetails.connDetails.asClient != nil {
+		p.aerospikeDetails.connDetails.asClient = nil
 	}
-	p.currentAsClient = nil
+	p.aerospikeDetails.connDetails.asClient = nil
 }
 
 type aerospikeMsg struct {
@@ -233,14 +221,10 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 		return nil, msg.GetError()
 	}
 
-	if p.key == nil {
-		var bFound bool
-		key, bFound = msg.MetaGetMut(kvpFieldKey)
-		if bFound == true {
-			p.key = key
-		}
-	} else {
-		key = p.key
+	var bFound bool
+	key, bFound = msg.MetaGetMut(metaKVKey)
+	if bFound == false {
+		return nil, fmt.Errorf("key not found in message metadata")
 	}
 
 	bytes, err := msg.AsBytes()
@@ -248,13 +232,13 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 		return nil, err
 	}
 
-	ctx, done := context.WithTimeout(ctx, p.timeout)
+	ctx, done := context.WithTimeout(ctx, p.aerospikeDetails.timeout)
 	defer done()
 
-	switch p.operation {
+	switch p.aerospikeDetails.operation {
 
 	case kvpOperationGet:
-		entry, err := Get(ctx, p, key)
+		entry, err := p.aerospikeDetails.Get(ctx, p, key)
 		if err != nil {
 			return nil, err
 		}
@@ -272,17 +256,17 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 	//	return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
 
 	case kvpOperationCreate:
-		revision, err := Create(ctx, p, key, bytes)
+		revision, err := p.aerospikeDetails.Create(ctx, key, bytes)
 		if err != nil {
 			return nil, err
 		}
 
 		m := msg.Copy()
-		p.addMetadata(m, key, uint64(revision), kvpOperationPut)
-		return service.MessageBatch{m}, nil
+		p.addMetadata(m, key, uint64(revision), kvpOperationCreate)
+		return service.MessageBatch{}, nil
 
 	case kvpOperationPut:
-		revision, err := Put(ctx, p, key, bytes)
+		revision, err := p.aerospikeDetails.Put(ctx, key, bytes)
 		if err != nil {
 			return nil, err
 		}
@@ -293,14 +277,11 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 
 	case kvpOperationUpdate:
 		revision := p.revision
-		if err != nil {
-			return nil, err
-		}
 		if revision == -1 {
 			revision = 0 // because we are using the default values
 		}
 
-		rev, err := Update(ctx, p, key, uint32(revision), bytes)
+		rev, err := p.aerospikeDetails.Update(ctx, key, uint32(revision), bytes)
 		if err != nil {
 			return nil, err
 		}
@@ -311,7 +292,7 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 
 	case kvpOperationDelete:
 		// TODO: Support revision here?
-		err := Delete(ctx, p, key)
+		err := p.aerospikeDetails.Delete(ctx, key)
 		if err != nil {
 			return nil, err
 		}
@@ -384,23 +365,19 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 	//	return service.MessageBatch{m}, nil
 
 	default:
-		return nil, fmt.Errorf("invalid kv operation: %s", p.operation)
+		return nil, fmt.Errorf("invalid kv operation: %s", p.aerospikeDetails.operation)
 	}
 }
 
-//func (p *kvProcessor) parseRevision(msg *service.Message) (uint64, error) {
-//	revStr, err := p.revision.TryString(msg)
-//	if err != nil {
-//		return 0, err
-//	}
-//
-//	return strconv.ParseUint(revStr, 10, 64)
-//}
-
 func (p *kvProcessor) addMetadata(msg *service.Message, key any, revision uint64, operation kvpOperationType) {
-	msg.MetaSetMut(metaKVKey, key)
-	msg.MetaSetMut(metaKVNamespace, p.namespace)
-	msg.MetaSetMut(metaKVSet, p.set)
+	_, bFlag := msg.MetaGetMut(metaKVKey)
+
+	if bFlag == false {
+		msg.MetaSetMut(metaKVKey, key)
+	}
+
+	msg.MetaSetMut(metaKVNamespace, p.aerospikeDetails.namespace)
+	msg.MetaSetMut(metaKVSet, p.aerospikeDetails.set)
 	msg.MetaSetMut(metaKVGeneration, revision)
 	msg.MetaSetMut(metaKVOperation, string(operation))
 }
@@ -411,49 +388,13 @@ func (p *kvProcessor) Connect(ctx context.Context) (err error) {
 
 	var asClient *as.Client
 
-	if asClient, err = p.connDetails.get(ctx); err != nil {
+	if asClient, err = p.aerospikeDetails.connDetails.get(ctx); err != nil {
 		return err
 	}
 
-	p.currentAsClient = asClient
-
-	//recordset, err := asClient.Get()
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//a.recordSet = recordset
+	p.aerospikeDetails.connDetails.asClient = asClient
 
 	return nil
-	//p.connMut.Lock()
-	//defer p.connMut.Unlock()
-	//
-	//if p.natsConn != nil {
-	//	return nil
-	//}
-	//
-	//defer func() {
-	//	if err != nil {
-	//		if p.natsConn != nil {
-	//			p.natsConn.Close()
-	//		}
-	//	}
-	//}()
-	//
-	//if p.natsConn, err = p.connDetails.get(ctx); err != nil {
-	//	return err
-	//}
-	//
-	//js, err := jetstream.New(p.natsConn)
-	//if err != nil {
-	//	return err
-	//}
-	//
-	//p.kv, err = js.KeyValue(ctx, p.set)
-	//if err != nil {
-	//	return err
-	//}
-	//return nil
 }
 
 func (p *kvProcessor) Close(ctx context.Context) error {

@@ -10,7 +10,8 @@ PATHINSTBIN        = $(DEST_DIR)/bin
 PATHINSTTOOLS      = $(DEST_DIR)/tools
 PATHINSTSERVERLESS = $(DEST_DIR)/serverless
 PATHINSTDOCKER     = $(DEST_DIR)/docker
-DOCKER_IMAGE       ?= ghcr.io/benthosdev/benthos
+#DOCKER_IMAGE       ?= ghcr.io/benthosdev/benthos
+DOCKER_IMAGE       ?= docker.io/oscarmherrera/benthos-aerospike
 
 VERSION   := $(shell git describe --tags || echo "v0.0.0")
 VER_CUT   := $(shell echo $(VERSION) | cut -c2-)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	as "github.com/aerospike/aerospike-client-go/v6"
+	p "golang.org/x/exp/apidiff/testdata"
 	"math"
 	"math/rand"
 	"strconv"
@@ -24,6 +25,7 @@ const (
 	coFieldConsistency = "consistency"
 	coFieldLoggedBatch = "logged_batch"
 	coFieldBatching    = "batching"
+	coFieldHeaders     = "headers"
 )
 
 func outputSpec() *service.ConfigSpec {
@@ -35,18 +37,23 @@ func outputSpec() *service.ConfigSpec {
 
 ` + connectionNameDescription() + authDescription()).
 		Fields(connectionHeadFields()...).
-		Field(service.NewInterpolatedStringField("subject").
-			Description("The set to publish to.").
-			Example("<namespace>.<set>")).
+		Field(service.NewStringAnnotatedEnumField(kvpFieldOperation, kvpOperations).
+			Description("The operation to perform on the KV set.")).
+		Field(service.NewStringField(kvFieldBucket).
+			Description("The fully qualified name of the <namespace>.<set> to interact with.")).
 		Field(service.NewInterpolatedStringMapField("headers").
 			Description("Explicit message headers to add to messages.").
 			Default(map[string]any{}).
+			Advanced().Optional().
 			Example(map[string]any{
 				"Timestamp": `${!meta("Timestamp")}`,
 			})).
 		Field(service.NewIntField("max_in_flight").
 			Description("The maximum number of messages to have in flight at a given time. Increase this to improve throughput.").
 			Default(64)).
+		Field(service.NewDurationField(kvpFieldTimeout).
+			Description("The maximum period to wait on an operation before aborting and returning an error.").
+			Advanced().Default("5s")).
 		Fields(connectionTailFields()...).
 		Field(outputTracingDocs())
 
@@ -71,21 +78,12 @@ func init() {
 }
 
 type aerospikeWriter struct {
-	connDetails        connectionDetails
-	log                *service.Logger
-	policyHeader       map[string]interface{}
-	maxInFlight        int
-	subject            string
-	namespace          string
-	set                string
-	currentAsClient    *as.Client
-	recordExistsAction as.RecordExistsAction
-	commitLevel        as.CommitLevel
-	generationPolicy   as.GenerationPolicy
-	durableDelete      bool
-	sendKey            bool
-	interruptChan      chan struct{}
-	interruptOnce      sync.Once
+	aerospikeDetails *aerospikeMsgData
+	policyHeader     map[string]interface{}
+	maxInFlight      int
+
+	interruptChan chan struct{}
+	interruptOnce sync.Once
 
 	argsMapping *bloblang.Executor
 	connLock    sync.RWMutex
@@ -93,35 +91,38 @@ type aerospikeWriter struct {
 
 func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *aerospikeWriter, err error) {
 	c = &aerospikeWriter{
-		log: mgr.Logger(),
-	}
-	//var err error
-	if c.connDetails, err = connectionDetailsFromParsed(conf, mgr); err != nil {
-		return nil, err
+		aerospikeDetails: &aerospikeMsgData{
+			log: mgr.Logger(),
+		},
 	}
 
-	//if c.query, err = conf.FieldString(coFieldQuery); err != nil {
-	//	return
-	//}
+	if c.aerospikeDetails.connDetails, err = connectionDetailsFromParsed(conf, mgr); err != nil {
+		return nil, err
+	}
 
 	c.maxInFlight, err = conf.FieldMaxInFlight()
 	if err != nil {
 		return nil, err
 	}
 
-	if c.subject, err = conf.FieldString("subject"); err != nil {
+	var subject string
+	if subject, err = conf.FieldString(kvFieldBucket); err != nil {
 		return nil, err
 	}
 
-	if strings.Count(c.subject, ".") != 1 {
-		return nil, errors.New("subject must be in the form of <namespace>.<set>")
+	if strings.Count(subject, ".") != 1 {
+		return nil, errors.New("namespace.set must be in the form of <namespace>.<set>")
 	}
 
-	c.namespace = strings.Split(c.subject, ".")[0]
-	c.set = strings.Split(c.subject, ".")[1]
+	c.aerospikeDetails.namespace = strings.Split(subject, ".")[0]
+	c.aerospikeDetails.set = strings.Split(subject, ".")[1]
 
-	headers, err := conf.FieldInterpolatedStringMap("headers")
+	headers, err := conf.FieldInterpolatedStringMap(coFieldHeaders)
 	if err != nil {
+		return nil, err
+	}
+
+	if c.aerospikeDetails.timeout, err = conf.FieldDuration(kvpFieldTimeout); err != nil {
 		return nil, err
 	}
 
@@ -150,51 +151,51 @@ func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-
+			c.aerospikeDetails.recordExistsAction = as.UPDATE
 		}
 		valInt, err := strconv.Atoi(s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse record_exists_action: %w", err)
 		}
-		c.recordExistsAction = as.RecordExistsAction(valInt)
+		c.aerospikeDetails.recordExistsAction = as.RecordExistsAction(valInt)
 	}
 
 	val, ok = headers["commit_level"]
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-
+			c.aerospikeDetails.commitLevel = as.COMMIT_MASTER
 		}
 		valInt, err := strconv.Atoi(s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse commit_level: %w", err)
 		}
-		c.commitLevel = as.CommitLevel(valInt)
+		c.aerospikeDetails.commitLevel = as.CommitLevel(valInt)
 	}
 
 	val, ok = headers["generation_policy"]
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-
+			c.aerospikeDetails.generationPolicy = as.NONE
 		}
 		valInt, err := strconv.Atoi(s)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse generation_policy: %w", err)
 		}
-		c.generationPolicy = as.GenerationPolicy(valInt)
+		c.aerospikeDetails.generationPolicy = as.GenerationPolicy(valInt)
 	}
 
 	val, ok = headers["durabe_delete"]
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-
+			c.aerospikeDetails.durableDelete = true
 		}
 		if strings.ToLower(s) == "true" {
-			c.durableDelete = true
+			c.aerospikeDetails.durableDelete = true
 		} else {
-			c.durableDelete = false
+			c.aerospikeDetails.durableDelete = false
 		}
 	}
 
@@ -202,7 +203,7 @@ func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-
+			c.sendKey = true
 		}
 		if strings.ToLower(s) == "true" {
 			c.sendKey = true
@@ -224,12 +225,7 @@ func (c *aerospikeWriter) Connect(ctx context.Context) error {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
 
-	//if n.natsConn != nil {
-	//	return nil
-	//}
-
 	var asClient *as.Client
-	//var natsSub *nats.Subscription
 	var err error
 
 	if asClient, err = c.connDetails.get(ctx); err != nil {
@@ -237,14 +233,13 @@ func (c *aerospikeWriter) Connect(ctx context.Context) error {
 	}
 
 	c.currentAsClient = asClient
-
 	return nil
 }
 
 func (c *aerospikeWriter) WriteBatch(ctx context.Context, batch service.MessageBatch) error {
 	c.connLock.RLock()
 
-	c.connLock.RUnlock()
+	defer c.connLock.RUnlock()
 
 	if c.currentAsClient == nil {
 		return service.ErrNotConnected
@@ -256,13 +251,25 @@ func (c *aerospikeWriter) WriteBatch(ctx context.Context, batch service.MessageB
 	return c.writeBatch(c.currentAsClient, batch)
 }
 
-func (c *aerospikeWriter) writeRow(b service.MessageBatch) error {
+func (c *aerospikeWriter) writeRow(ctx context.Context, b service.MessageBatch) error {
 	values, err := c.mapArgs(b, 0)
 	if err != nil {
 		return fmt.Errorf("parsing args: %w", err)
 	}
-
 	msg := values[0].(*service.Message)
+
+	key, bFound := msg.MetaGetMut(metaKVKey)
+	if !bFound {
+		return fmt.Errorf("key not found in message metadata")
+	}
+	bytes, err := msg.AsBytes()
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, done := context.WithTimeout(ctx, c.timeout)
+	defer done()
+
 	return c.writeAerospikeRecordFromMessage(msg)
 }
 
@@ -271,6 +278,158 @@ func (c *aerospikeWriter) writeBatch(client *as.Client, b service.MessageBatch) 
 	for i := range b {
 		values, err := c.mapArgs(b, i)
 		msg := values[0].(*service.Message)
+
+		if msg.GetError() != nil {
+			return msg.GetError()
+		}
+
+		var bFound bool
+		key, bFound = msg.MetaGetMut(metaKVKey)
+		if bFound == false {
+			return fmt.Errorf("key not found in message metadata")
+		}
+
+		bytes, err := msg.AsBytes()
+		if err != nil {
+			return err
+		}
+
+		ctx, done := context.WithTimeout(ctx, c.aerospikeDetails.timeout)
+		defer done()
+
+		switch p.aerospikeDetails.operation {
+
+		case kvpOperationGet:
+			entry, err := p.aerospikeDetails.Get(ctx, p, key)
+			if err != nil {
+				return nil, err
+			}
+			return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
+
+		//case kvpOperationGetRevision:
+		//	revision, err := p.parseRevision(msg)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//	entry, err := kv.GetRevision(ctx, key, revision)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//	return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
+
+		case kvpOperationCreate:
+			revision, err := p.aerospikeDetails.Create(ctx, key, bytes)
+			if err != nil {
+				return nil, err
+			}
+
+			m := msg.Copy()
+			p.addMetadata(m, key, uint64(revision), kvpOperationCreate)
+			return service.MessageBatch{}, nil
+
+		case kvpOperationPut:
+			revision, err := p.aerospikeDetails.Put(ctx, key, bytes)
+			if err != nil {
+				return nil, err
+			}
+
+			m := msg.Copy()
+			p.addMetadata(m, key, uint64(revision), kvpOperationPut)
+			return service.MessageBatch{m}, nil
+
+		case kvpOperationUpdate:
+			revision := p.revision
+			if revision == -1 {
+				revision = 0 // because we are using the default values
+			}
+
+			rev, err := p.aerospikeDetails.Update(ctx, key, uint32(revision), bytes)
+			if err != nil {
+				return nil, err
+			}
+
+			m := msg.Copy()
+			p.addMetadata(m, key, uint64(rev), kvpOperationPut)
+			return service.MessageBatch{m}, nil
+
+		case kvpOperationDelete:
+			// TODO: Support revision here?
+			err := p.aerospikeDetails.Delete(ctx, key)
+			if err != nil {
+				return nil, err
+			}
+
+			m := msg.Copy()
+			p.addMetadata(m, key, 0, kvpOperationDelete)
+			return service.MessageBatch{m}, nil
+
+		//case kvpOperationPurge:
+		//	err := kv.Purge(ctx, key)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	m := msg.Copy()
+		//	p.addMetadata(m, key, 0, nats.KeyValuePurge)
+		//	return service.MessageBatch{m}, nil
+		//
+		//case kvpOperationHistory:
+		//	entries, err := kv.History(ctx, key)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//	var records []any
+		//	for _, entry := range entries {
+		//		records = append(records, map[string]any{
+		//			"key":   entry.Key(),
+		//			"value": entry.Value(),
+		//			//"bucket":    entry.Bucket(),
+		//			"revision":  entry.Revision(),
+		//			"delta":     entry.Delta(),
+		//			"operation": entry.Operation().String(),
+		//			"created":   entry.Created(),
+		//		})
+		//	}
+		//
+		//	m := service.NewMessage(nil)
+		//	m.SetStructuredMut(records)
+		//	return service.MessageBatch{m}, nil
+
+		//case kvpOperationKeys:
+		//	// `kv.ListKeys()` does not allow users to specify a key filter, so we call `kv.Watch()` directly.
+		//	watcher, err := kv.Watch(ctx, key, []jetstream.WatchOpt{jetstream.IgnoreDeletes(), jetstream.MetaOnly()}...)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//	defer func() {
+		//		if err := watcher.Stop(); err != nil {
+		//			p.log.Debugf("Failed to close key watcher: %s", err)
+		//		}
+		//	}()
+		//
+		//	var keys []any
+		//loop:
+		//	for {
+		//		select {
+		//		case entry := <-watcher.Updates():
+		//			if entry == nil {
+		//				break loop
+		//			}
+		//			keys = append(keys, entry.Key())
+		//		case <-ctx.Done():
+		//			return nil, fmt.Errorf("watcher update loop exited prematurely: %s", ctx.Err())
+		//		}
+		//	}
+		//
+		//	m := service.NewMessage(nil)
+		//	m.SetStructuredMut(keys)
+		//	m.MetaSetMut(metaKVBucket, p.set)
+		//	return service.MessageBatch{m}, nil
+
+		default:
+			return nil, fmt.Errorf("invalid kv operation: %s", p.aerospikeDetails.operation)
+		}
+
 		err = c.writeAerospikeRecordFromMessage(msg)
 		if err != nil {
 			return err

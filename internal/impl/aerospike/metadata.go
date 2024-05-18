@@ -5,7 +5,7 @@ import (
 )
 
 const (
-	metaKVKey        = "nats_kv_key"
+	metaKVKey        = "aerospike_key"
 	metaKVNamespace  = "aerospike_namespace"
 	metaKVSet        = "aerospike_set"
 	metaKVExpiration = "aerospike_expiration"
