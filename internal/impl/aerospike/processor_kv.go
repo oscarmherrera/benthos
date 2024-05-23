@@ -238,7 +238,7 @@ func (p *kvProcessor) Process(ctx context.Context, msg *service.Message) (servic
 	switch p.aerospikeDetails.operation {
 
 	case kvpOperationGet:
-		entry, err := p.aerospikeDetails.Get(ctx, p, key)
+		entry, err := p.aerospikeDetails.Get(ctx, key)
 		if err != nil {
 			return nil, err
 		}

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	as "github.com/aerospike/aerospike-client-go/v6"
-	p "golang.org/x/exp/apidiff/testdata"
 	"math"
 	"math/rand"
 	"strconv"
@@ -203,12 +202,12 @@ func newAerospikeWriter(conf *service.ParsedConfig, mgr *service.Resources) (c *
 	if ok {
 		s, isStatic := val.Static()
 		if !isStatic {
-			c.sendKey = true
+			c.aerospikeDetails.sendKey = true
 		}
 		if strings.ToLower(s) == "true" {
-			c.sendKey = true
+			c.aerospikeDetails.sendKey = true
 		} else {
-			c.sendKey = false
+			c.aerospikeDetails.sendKey = false
 		}
 	}
 
@@ -228,11 +227,11 @@ func (c *aerospikeWriter) Connect(ctx context.Context) error {
 	var asClient *as.Client
 	var err error
 
-	if asClient, err = c.connDetails.get(ctx); err != nil {
+	if asClient, err = c.aerospikeDetails.connDetails.get(ctx); err != nil {
 		return err
 	}
 
-	c.currentAsClient = asClient
+	c.aerospikeDetails.connDetails.asClient = asClient
 	return nil
 }
 
@@ -241,14 +240,14 @@ func (c *aerospikeWriter) WriteBatch(ctx context.Context, batch service.MessageB
 
 	defer c.connLock.RUnlock()
 
-	if c.currentAsClient == nil {
+	if c.aerospikeDetails.connDetails.asClient == nil {
 		return service.ErrNotConnected
 	}
 
 	if len(batch) == 1 {
-		return c.writeRow(batch)
+		return c.writeRow(context.Background(), batch)
 	}
-	return c.writeBatch(c.currentAsClient, batch)
+	return c.writeBatch(ctx, c.aerospikeDetails.connDetails.asClient, batch)
 }
 
 func (c *aerospikeWriter) writeRow(ctx context.Context, b service.MessageBatch) error {
@@ -258,182 +257,180 @@ func (c *aerospikeWriter) writeRow(ctx context.Context, b service.MessageBatch) 
 	}
 	msg := values[0].(*service.Message)
 
-	key, bFound := msg.MetaGetMut(metaKVKey)
-	if !bFound {
-		return fmt.Errorf("key not found in message metadata")
-	}
-	bytes, err := msg.AsBytes()
-	if err != nil {
-		return nil, err
-	}
-
-	ctx, done := context.WithTimeout(ctx, c.timeout)
-	defer done()
-
 	return c.writeAerospikeRecordFromMessage(msg)
 }
 
-func (c *aerospikeWriter) writeBatch(client *as.Client, b service.MessageBatch) error {
+func (c *aerospikeWriter) writeBatch(ctx context.Context, client *as.Client, b service.MessageBatch) error {
 
 	for i := range b {
 		values, err := c.mapArgs(b, i)
+		if err != nil {
+			return fmt.Errorf("parsing args: %w", err)
+		}
 		msg := values[0].(*service.Message)
 
 		if msg.GetError() != nil {
 			return msg.GetError()
 		}
 
-		var bFound bool
-		key, bFound = msg.MetaGetMut(metaKVKey)
-		if bFound == false {
-			return fmt.Errorf("key not found in message metadata")
-		}
-
-		bytes, err := msg.AsBytes()
-		if err != nil {
-			return err
-		}
-
-		ctx, done := context.WithTimeout(ctx, c.aerospikeDetails.timeout)
-		defer done()
-
-		switch p.aerospikeDetails.operation {
-
-		case kvpOperationGet:
-			entry, err := p.aerospikeDetails.Get(ctx, p, key)
-			if err != nil {
-				return nil, err
-			}
-			return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
-
-		//case kvpOperationGetRevision:
-		//	revision, err := p.parseRevision(msg)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//	entry, err := kv.GetRevision(ctx, key, revision)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//	return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
-
-		case kvpOperationCreate:
-			revision, err := p.aerospikeDetails.Create(ctx, key, bytes)
-			if err != nil {
-				return nil, err
-			}
-
-			m := msg.Copy()
-			p.addMetadata(m, key, uint64(revision), kvpOperationCreate)
-			return service.MessageBatch{}, nil
-
-		case kvpOperationPut:
-			revision, err := p.aerospikeDetails.Put(ctx, key, bytes)
-			if err != nil {
-				return nil, err
-			}
-
-			m := msg.Copy()
-			p.addMetadata(m, key, uint64(revision), kvpOperationPut)
-			return service.MessageBatch{m}, nil
-
-		case kvpOperationUpdate:
-			revision := p.revision
-			if revision == -1 {
-				revision = 0 // because we are using the default values
-			}
-
-			rev, err := p.aerospikeDetails.Update(ctx, key, uint32(revision), bytes)
-			if err != nil {
-				return nil, err
-			}
-
-			m := msg.Copy()
-			p.addMetadata(m, key, uint64(rev), kvpOperationPut)
-			return service.MessageBatch{m}, nil
-
-		case kvpOperationDelete:
-			// TODO: Support revision here?
-			err := p.aerospikeDetails.Delete(ctx, key)
-			if err != nil {
-				return nil, err
-			}
-
-			m := msg.Copy()
-			p.addMetadata(m, key, 0, kvpOperationDelete)
-			return service.MessageBatch{m}, nil
-
-		//case kvpOperationPurge:
-		//	err := kv.Purge(ctx, key)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//
-		//	m := msg.Copy()
-		//	p.addMetadata(m, key, 0, nats.KeyValuePurge)
-		//	return service.MessageBatch{m}, nil
-		//
-		//case kvpOperationHistory:
-		//	entries, err := kv.History(ctx, key)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//	var records []any
-		//	for _, entry := range entries {
-		//		records = append(records, map[string]any{
-		//			"key":   entry.Key(),
-		//			"value": entry.Value(),
-		//			//"bucket":    entry.Bucket(),
-		//			"revision":  entry.Revision(),
-		//			"delta":     entry.Delta(),
-		//			"operation": entry.Operation().String(),
-		//			"created":   entry.Created(),
-		//		})
-		//	}
-		//
-		//	m := service.NewMessage(nil)
-		//	m.SetStructuredMut(records)
-		//	return service.MessageBatch{m}, nil
-
-		//case kvpOperationKeys:
-		//	// `kv.ListKeys()` does not allow users to specify a key filter, so we call `kv.Watch()` directly.
-		//	watcher, err := kv.Watch(ctx, key, []jetstream.WatchOpt{jetstream.IgnoreDeletes(), jetstream.MetaOnly()}...)
-		//	if err != nil {
-		//		return nil, err
-		//	}
-		//	defer func() {
-		//		if err := watcher.Stop(); err != nil {
-		//			p.log.Debugf("Failed to close key watcher: %s", err)
-		//		}
-		//	}()
-		//
-		//	var keys []any
-		//loop:
-		//	for {
-		//		select {
-		//		case entry := <-watcher.Updates():
-		//			if entry == nil {
-		//				break loop
-		//			}
-		//			keys = append(keys, entry.Key())
-		//		case <-ctx.Done():
-		//			return nil, fmt.Errorf("watcher update loop exited prematurely: %s", ctx.Err())
-		//		}
-		//	}
-		//
-		//	m := service.NewMessage(nil)
-		//	m.SetStructuredMut(keys)
-		//	m.MetaSetMut(metaKVBucket, p.set)
-		//	return service.MessageBatch{m}, nil
-
-		default:
-			return nil, fmt.Errorf("invalid kv operation: %s", p.aerospikeDetails.operation)
-		}
+		//var bFound bool
+		//key, bFound := msg.MetaGetMut(metaKVKey)
+		//if bFound == false {
+		//	return fmt.Errorf("key not found in message metadata")
+		//}
 
 		err = c.writeAerospikeRecordFromMessage(msg)
 		if err != nil {
 			return err
 		}
+
+		//bytes, err := msg.AsBytes()
+		//if err != nil {
+		//	return err
+		//}
+		//
+		//ctx, done := context.WithTimeout(ctx, c.aerospikeDetails.timeout)
+		//defer done()
+		//
+		//switch c.aerospikeDetails.operation {
+		//
+		////case kvpOperationGet:
+		////	entry, err := c.aerospikeDetails.Get(ctx, key)
+		////	if err != nil {
+		////
+		////		return err
+		////	}
+		////	service.MessageBatch{newMessageFromKVEntry(entry)}
+		////	return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
+		//
+		////case kvpOperationGetRevision:
+		////	revision, err := p.parseRevision(msg)
+		////	if err != nil {
+		////		return nil, err
+		////	}
+		////	entry, err := kv.GetRevision(ctx, key, revision)
+		////	if err != nil {
+		////		return nil, err
+		////	}
+		////	return service.MessageBatch{newMessageFromKVEntry(entry)}, nil
+		//
+		//case kvpOperationCreate:
+		//	_, err := c.aerospikeDetails.Create(ctx, key, bytes)
+		//	if err != nil {
+		//		return err
+		//	}
+		//
+		//	m := msg.Copy()
+		//	c.addMetadata(m, key, uint64(revision), kvpOperationCreate)
+		//	return service.MessageBatch{}, nil
+		//
+		//case kvpOperationPut:
+		//	revision, err := c.aerospikeDetails.Put(ctx, key, bytes)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	m := msg.Copy()
+		//	p.addMetadata(m, key, uint64(revision), kvpOperationPut)
+		//	return service.MessageBatch{m}, nil
+		//
+		//case kvpOperationUpdate:
+		//	revision := p.revision
+		//	if revision == -1 {
+		//		revision = 0 // because we are using the default values
+		//	}
+		//
+		//	rev, err := c.aerospikeDetails.Update(ctx, key, uint32(revision), bytes)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	m := msg.Copy()
+		//	p.addMetadata(m, key, uint64(rev), kvpOperationPut)
+		//	return service.MessageBatch{m}, nil
+		//
+		//case kvpOperationDelete:
+		//	// TODO: Support revision here?
+		//	err := c.aerospikeDetails.Delete(ctx, key)
+		//	if err != nil {
+		//		return nil, err
+		//	}
+		//
+		//	m := msg.Copy()
+		//	p.addMetadata(m, key, 0, kvpOperationDelete)
+		//	return service.MessageBatch{m}, nil
+		//
+		////case kvpOperationPurge:
+		////	err := kv.Purge(ctx, key)
+		////	if err != nil {
+		////		return nil, err
+		////	}
+		////
+		////	m := msg.Copy()
+		////	p.addMetadata(m, key, 0, nats.KeyValuePurge)
+		////	return service.MessageBatch{m}, nil
+		////
+		////case kvpOperationHistory:
+		////	entries, err := kv.History(ctx, key)
+		////	if err != nil {
+		////		return nil, err
+		////	}
+		////	var records []any
+		////	for _, entry := range entries {
+		////		records = append(records, map[string]any{
+		////			"key":   entry.Key(),
+		////			"value": entry.Value(),
+		////			//"bucket":    entry.Bucket(),
+		////			"revision":  entry.Revision(),
+		////			"delta":     entry.Delta(),
+		////			"operation": entry.Operation().String(),
+		////			"created":   entry.Created(),
+		////		})
+		////	}
+		////
+		////	m := service.NewMessage(nil)
+		////	m.SetStructuredMut(records)
+		////	return service.MessageBatch{m}, nil
+		//
+		////case kvpOperationKeys:
+		////	// `kv.ListKeys()` does not allow users to specify a key filter, so we call `kv.Watch()` directly.
+		////	watcher, err := kv.Watch(ctx, key, []jetstream.WatchOpt{jetstream.IgnoreDeletes(), jetstream.MetaOnly()}...)
+		////	if err != nil {
+		////		return nil, err
+		////	}
+		////	defer func() {
+		////		if err := watcher.Stop(); err != nil {
+		////			p.log.Debugf("Failed to close key watcher: %s", err)
+		////		}
+		////	}()
+		////
+		////	var keys []any
+		////loop:
+		////	for {
+		////		select {
+		////		case entry := <-watcher.Updates():
+		////			if entry == nil {
+		////				break loop
+		////			}
+		////			keys = append(keys, entry.Key())
+		////		case <-ctx.Done():
+		////			return nil, fmt.Errorf("watcher update loop exited prematurely: %s", ctx.Err())
+		////		}
+		////	}
+		////
+		////	m := service.NewMessage(nil)
+		////	m.SetStructuredMut(keys)
+		////	m.MetaSetMut(metaKVBucket, p.set)
+		////	return service.MessageBatch{m}, nil
+		//
+		//default:
+		//	return nil, fmt.Errorf("invalid kv operation: %s", c.aerospikeDetails.operation)
+		//}
+		//
+		//err = c.writeAerospikeRecordFromMessage(msg)
+		//if err != nil {
+		//	return err
+		//}
 	}
 	return nil
 }
@@ -530,18 +527,18 @@ func (c *aerospikeWriter) writeAerospikeRecordFromMessage(msg *service.Message) 
 	id, bFound := msg.MetaGetMut("id")
 
 	policy := as.NewWritePolicy(gen.(uint32), exp.(uint32))
-	policy.SendKey = c.sendKey
-	policy.RecordExistsAction = c.recordExistsAction
-	policy.CommitLevel = c.commitLevel
-	policy.GenerationPolicy = c.generationPolicy
-	policy.DurableDelete = c.durableDelete
+	policy.SendKey = c.aerospikeDetails.sendKey
+	policy.RecordExistsAction = c.aerospikeDetails.recordExistsAction
+	policy.CommitLevel = c.aerospikeDetails.commitLevel
+	policy.GenerationPolicy = c.aerospikeDetails.generationPolicy
+	policy.DurableDelete = c.aerospikeDetails.durableDelete
 
-	key, err = as.NewKey(c.namespace, c.set, id)
+	key, err = as.NewKey(c.aerospikeDetails.namespace, c.aerospikeDetails.set, id)
 	if err != nil {
 		return fmt.Errorf("failed to create key: %w", err)
 	}
 
-	err = c.currentAsClient.Put(policy, key, binMap)
+	err = c.aerospikeDetails.connDetails.asClient.Put(policy, key, binMap)
 	if err != nil {
 		return fmt.Errorf("failed to write row: %w", err)
 	}
@@ -553,8 +550,8 @@ func (c *aerospikeWriter) disconnect() {
 	c.connLock.Lock()
 	defer c.connLock.Unlock()
 
-	if c.currentAsClient != nil {
-		c.currentAsClient = nil
+	if c.aerospikeDetails.connDetails.asClient != nil {
+		c.aerospikeDetails.connDetails.asClient = nil
 	}
-	c.currentAsClient = nil
+	c.aerospikeDetails.connDetails.asClient = nil
 }

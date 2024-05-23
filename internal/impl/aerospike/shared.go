@@ -23,7 +23,7 @@ type aerospikeMsgData struct {
 	timeout            time.Duration
 }
 
-func (a *aerospikeMsgData) Get(ctx context.Context, p *kvProcessor, key any) (*aerospikeMsg, error) {
+func (a *aerospikeMsgData) Get(ctx context.Context, key any) (*aerospikeMsg, error) {
 	policy := aerospike.NewPolicy()
 	policy.SendKey = true
 	var err error
@@ -55,7 +55,7 @@ func (a *aerospikeMsgData) Get(ctx context.Context, p *kvProcessor, key any) (*a
 		return nil, fmt.Errorf("unsupported user key type %T", v)
 	}
 
-	record, err := p.aerospikeDetails.connDetails.asClient.Get(policy, asKey)
+	record, err := a.connDetails.asClient.Get(policy, asKey)
 
 	if err != nil {
 		return nil, err
